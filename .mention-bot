@@ -1,0 +1,4 @@
+{
+  "fileBlacklist": ["*.md", "*.csproj", "*.sln"], // mention-bot will ignore any files that match these file globs
+  "requiredOrgs": ["Configit"] // mention-bot will only mention user who are a member of one of these organizations
+}
