@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2015-present, Facebook, Inc.
+ * Copyright (c) 2016-present, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -10,19 +10,20 @@
  */
 
 var bl = require('bl');
-var config = require('./package.json').config;
+var config = require('./config');
 var express = require('express');
 var fs = require('fs');
 var mentionBot = require('./mention-bot.js');
 var messageGenerator = require('./message.js');
 var util = require('util');
+var schedule = require('./schedule.js');
 
 var GitHubApi = require('github');
 
 var CONFIG_PATH = '.mention-bot';
 
 if (!process.env.GITHUB_TOKEN) {
-  console.error('The bot was started without a github account to post with.');
+  console.error('The bot was started without a GitHub account to post with.');
   console.error('To get started:');
   console.error('1) Create a new account for the bot');
   console.error('2) Settings > Personal access tokens > Generate new token');
@@ -31,29 +32,29 @@ if (!process.env.GITHUB_TOKEN) {
   console.error('GITHUB_TOKEN=insert_token_here npm start');
   console.error('5) Run the following command in another tab:');
   console.error('curl -X POST -d @__tests__/data/23.webhook http://localhost:5000/');
-  console.error('6) Check that it commented here: https://github.com/fbsamples/bot-testing/pull/23');
+  console.error('6) Check if it has commented here: https://github.com/fbsamples/bot-testing/pull/23');
   process.exit(1);
 }
 
 if (!process.env.GITHUB_USER) {
   console.warn(
-    'There was no github user detected.',
+    'There was no GitHub user detected.',
     'This is fine, but mention-bot won\'t work with private repos.'
   );
   console.warn(
     'To make mention-bot work with private repos, please expose',
     'GITHUB_USER and GITHUB_PASSWORD as environment variables.',
-    'The user and password must have access to the private repo',
+    'The username and password must have access to the private repo',
     'you want to use.'
   );
 }
 
 var github = new GitHubApi({
   version: '3.0.0',
-  host: config.gheHost,
-  pathPrefix: config.ghePathPrefix,
-  protocol: config.gheProtocol || 'https',
-  port: config.ghePort || '443'
+  host: config.github.apiHost,
+  pathPrefix: config.github.pathPrefix,
+  protocol: config.github.protocol,
+  port: config.github.port
 });
 
 github.authenticate({
@@ -76,20 +77,27 @@ function buildMentionSentence(reviewers) {
   );
 }
 
-function defaultMessageGenerator(reviewers) {
+function defaultMessageGenerator(reviewers, pullRequester) {
   return util.format(
-    'By analyzing the blame information on this pull request' +
-     ', we identified %s to be%s potential reviewer%s',
-     buildMentionSentence(reviewers),
-     reviewers.length > 1 ? '' : ' a',
-     reviewers.length > 1 ? 's' : ''
+    '%s, thanks for your PR! ' +
+    'By analyzing the annotation information on this pull request' +
+    ', we identified %s to be%s potential reviewer%s',
+    pullRequester,
+    buildMentionSentence(reviewers),
+    reviewers.length > 1 ? '' : ' a',
+    reviewers.length > 1 ? 's' : ''
   );
+}
+
+function configMessageGenerator(message, reviewers, pullRequester) {
+  var withReviewers = message.replace(/@reviewers/g, buildMentionSentence(reviewers));
+  return withReviewers.replace(/@pullRequester/g, pullRequester);
 }
 
 function getRepoConfig(request) {
   return new Promise(function(resolve, reject) {
     github.repos.getContent(request, function(err, result) {
-      if(err) {
+      if (err) {
         reject(err);
       }
       resolve(result);
@@ -105,14 +113,6 @@ async function work(body) {
     console.error(e);
   }
 
-  if (data.action !== 'opened') {
-    console.log(
-      'Skipping because action is ' + data.action + '.',
-      'We only care about opened.'
-    );
-    return;
-  }
-
   // default config
   var repoConfig = {
     maxReviewers: 3,
@@ -122,6 +122,16 @@ async function work(body) {
     userWhitelist: [],
     fileBlacklist: [],
     requiredOrgs: [],
+    findPotentialReviewers: true,
+    actions: ['opened'],
+    skipAlreadyAssignedPR: false,
+    skipAlreadyMentionedPR: false,
+    delayed: false,
+    delayedUntil: '3d',
+    assignToReviewer: false,
+    skipTitle: '',
+    withLabel: '',
+    skipCollaboratorPR: false,
   };
 
   try {
@@ -130,6 +140,7 @@ async function work(body) {
       user: data.repository.owner.login,
       repo: data.repository.name,
       path: CONFIG_PATH,
+      ref: data.pull_request.head.ref,
       headers: {
         Accept: 'application/vnd.github.v3.raw'
       }
@@ -140,9 +151,75 @@ async function work(body) {
     console.error(e);
   }
 
-  if (repoConfig.userBlacklistForPR.indexOf(data.pull_request.user.login) >= 0) {
-    console.log('Skipping because blacklisted user created Pull Request.');
+  function isValid(repoConfig, data) {
+    if (repoConfig.actions.indexOf(data.action) === -1) {
+      console.log(
+        'Skipping because action is ' + data.action + '.',
+        'We only care about: "' + repoConfig.actions.join("', '") + '"'
+      );
+      return false;
+    }
+
+    if (repoConfig.withLabel && data.label &&
+        data.label.name != repoConfig.withLabel) {
+      console.log('Skipping because pull request does not have label: ' + repoConfig.withLabel);
+      return false;
+    }
+
+    if (repoConfig.skipTitle &&
+        data.pull_request.title.indexOf(repoConfig.skipTitle) > -1) {
+      console.log('Skipping because pull request title contains: ' + repoConfig.skipTitle);
+      return false;
+    }
+
+    if (repoConfig.skipCollaboratorPR) {
+      github.repos.getCollaborator({
+        user: data.repository.owner.login, // 'fbsamples'
+        repo: data.repository.name, // 'bot-testing'
+        collabuser: data.pull_request.user.login
+      }, function(err, res){
+        if (res && res.meta.status === '204 No Content') {
+          console.log('Skipping because pull request is made by collaborator.');
+          return false;
+        }
+      });
+    }
+
+    if (repoConfig.skipAlreadyAssignedPR &&
+        data.pull_request.assignee &&
+        data.pull_request.assignee.login) {
+      console.log('Skipping because pull request is already assigned.');
+      return false;
+    }
+
+    if (process.env.REQUIRED_ORG) {
+      if (repoConfig.requiredOrgs.indexOf(process.env.REQUIRED_ORG) === -1) {
+        repoConfig.requiredOrgs.push(process.env.REQUIRED_ORG);
+      }
+    }
+
+    if (repoConfig.userBlacklistForPR.indexOf(data.pull_request.user.login) >= 0) {
+      console.log('Skipping because blacklisted user created Pull Request.');
+      return false;
+    }
+
+    if (repoConfig.skipTitle &&
+        data.pull_request.title.indexOf(repoConfig.skipTitle) > -1) {
+      console.log('Skipping because pull request title contains: ' + repoConfig.skipTitle);
+      return false;
+    }
+
+    return true;
+  }
+
+  if (!isValid(repoConfig, data)) {
     return;
+  }
+
+  var org = null;
+
+  if (data.organization) {
+    org = data.organization.login;
   }
 
   var reviewers = await mentionBot.guessOwnersForPullRequest(
@@ -150,6 +227,8 @@ async function work(body) {
     data.pull_request.number, // 23
     data.pull_request.user.login, // 'mention-bot'
     data.pull_request.base.ref, // 'master'
+    data.repository.private, //true or false
+    org, //the org name of the repo
     repoConfig,
     github
   );
@@ -161,16 +240,112 @@ async function work(body) {
     return;
   }
 
-  github.issues.createComment({
-    user: data.repository.owner.login, // 'fbsamples'
-    repo: data.repository.name, // 'bot-testing'
-    number: data.pull_request.number, // 23
-    body: messageGenerator(
+  var message = null;
+  if (repoConfig.message) {
+    message = configMessageGenerator(
+      repoConfig.message,
       reviewers,
+      '@' + data.pull_request.user.login
+    );
+  } else {
+    message = messageGenerator(
+      reviewers,
+      '@' + data.pull_request.user.login, // pull-requester
       buildMentionSentence,
       defaultMessageGenerator
-    )
-  });
+    );
+  }
+
+  function createComment(data, message, reject) {
+    github.issues.createComment({
+      user: data.repository.owner.login, // 'fbsamples'
+      repo: data.repository.name, // 'bot-testing'
+      number: data.pull_request.number, // 23
+      body: message
+    }, function(err) {
+      if (err) {
+        if (typeof reject === 'function') {
+          return reject(err);
+        }
+      }
+    })
+  }
+
+  function assignReviewer(data, reviewers, reject) {
+    if (!repoConfig.assignToReviewer) {
+      return;
+    }
+
+    github.issues.edit({
+      user: data.repository.owner.login, // 'fbsamples'
+      repo: data.repository.name, // 'bot-testing'
+      number: data.pull_request.number, // 23
+      assignee: reviewers[0]
+    }, function(err) {
+      if (err) {
+        if (typeof reject === 'function') {
+          return reject(err);
+        }
+      }
+    });
+  }
+
+  function getComments(data, page) {
+    return new Promise(function(resolve, reject) {
+      github.issues.getComments({
+        user: data.repository.owner.login, // 'fbsamples'
+        repo: data.repository.name, // 'bot-testing'
+        number: data.pull_request.number, // 23
+        page: page, // 1
+        per_page: 100 // maximum supported
+      }, function(err, result) {
+        if (err) {
+          reject(err);
+        }
+        resolve(result);
+      });
+    });
+  }
+
+  if (repoConfig.skipAlreadyMentionedPR) {
+    var page;
+    var comments = [[]];
+
+    for (page = 1; comments.length != 0; ++page) {
+      comments = await getComments(data, page);
+      if (comments.find(function(comment) {
+        return comment.body == message;
+      })) {
+        console.log('Skipping because there is already existing an exact mention.');
+        return;
+      }
+    }
+  }
+
+  if (repoConfig.delayed) {
+    schedule.performAt(schedule.parse(repoConfig.delayedUntil), function(resolve, reject) {
+      github.pullRequests.get({
+        user: data.repository.owner.login,
+        repo: data.repository.name,
+        number: data.pull_request.number
+      }, function(err, currentData) {
+        if (err) {
+          reject(err);
+          return;
+        }
+
+        if (!isValid(repoConfig, currentData)) {
+          return;
+        }
+
+        createComment(currentData, message, reject);
+        assignReviewer(currentData, reviewers, reject);
+      });
+    });
+  } else {
+    createComment(data, message);
+    assignReviewer(data, reviewers);
+  }
 
   return;
 };
@@ -178,7 +353,7 @@ async function work(body) {
 app.post('/', function(req, res) {
   req.pipe(bl(function(err, body) {
     work(body).then(function() { res.end(); });
- }));
+  }));
 });
 
 app.get('/', function(req, res) {

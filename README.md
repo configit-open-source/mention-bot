@@ -8,8 +8,8 @@ Do you have a GitHub project that is too big for people to subscribe to all the 
 
 - Go to
  - your project on GitHub > Settings > Webhooks & services > Add Webhook or
- - your organization on GitHub > Settings > Webhooks > Add Webhook  
-- Payload URL: `https://mention-bot.herokuapp.com/`
+ - your organization on GitHub > Settings > Webhooks > Add Webhook
+- Payload URL: (https://mention-bot.herokuapp.com/)
 - Let me select individual events > Check `Pull Request`
 - Add Webhook
 
@@ -23,19 +23,38 @@ The bot can be configured by adding a `.mention-bot` file to the base directory 
 {
   "maxReviewers": 5, // Maximum  number of people to ping in the PR message, default is 3
   "numFilesToCheck": 10, // Number of files to check against, default is 5
+  "message": "@pullRequester, thanks! @reviewers, please review this.",
+             // custom message using @pullRequester and @reviewers
   "alwaysNotifyForPaths": [
     {
       "name": "ghuser", // The user's Github username
       "files": ["src/js/**/*.js"] // The array of file globs associated with the user
     }
   ], // users will always be mentioned based on file glob
+  "fallbackNotifyForPaths": [
+    {
+      "name": "ghuser", // The user's Github username
+      "files": ["src/js/**/*.js"] // The array of file globs associated with the user
+    }
+  ], // users will be mentioned based on file glob if no other user was found
+  "findPotentialReviewers": true, // mention-bot will try to find potential reviewers based on files history, if disabled, `alwaysNotifyForPaths` is used instead
   "fileBlacklist": ["*.md"], // mention-bot will ignore any files that match these file globs
   "userBlacklist": [], // users in this list will never be mentioned by mention-bot
   "userBlacklistForPR": [], // PR made by users in this list will be ignored
-  "requiredOrgs": [] // mention-bot will only mention user who are a member of one of these organizations
+  "requiredOrgs": [], // mention-bot will only mention user who are a member of one of these organizations
+  "actions": ["opened"], // List of PR actions that mention-bot will listen to, default is "opened"
+  "skipAlreadyAssignedPR": false, // mention-bot will ignore already assigned PR's
+  "skipAlreadyMentionedPR": false, // mention-bot will ignore if there is already existing an exact mention
+  "assignToReviewer": false, // mention-bot assigns the most appropriate reviewer for PR
+  "skipTitle": "", // mention-bot will ignore PR that includes text in the title,
+  "withLabel": "", // mention-bot will only consider PR's with this label. Must set actions to ["labeled"].
+  "delayed": false, // mention-bot will wait to comment until specified time in `delayedUntil` value
+  "delayedUntil": "3d", // Used if delayed is equal true, permitted values are: minutes, hours, or days, e.g.: '3 days', '40 minutes', '1 hour', '3d', '1h', '10m'
+  "skipCollaboratorPR": false, // mention-bot will ignore if PR is made by collaborator
 }
 ```
 
+The glob matching is an extended form of glob syntax performed by [`minimatch`](https://github.com/isaacs/minimatch), with the default options; read [the `minimatch` README](https://github.com/isaacs/minimatch/blob/master/README.md) for more details.
 
 ## How Does It Work?
 
@@ -99,9 +118,18 @@ Alternatively, click the button below:
 
 If you would like the mention-bot to function on private repositories, set the `GITHUB_USER` and `GITHUB_PASSWORD` environment variables. You must disable two-factor authentication or you will receive a console log like this: `Login to ${USERNAME} failed`.
 
+You can also set a `REQUIRED_ORG` environment variable, so you don't have to configure it in each repository of your organization.
+
+You can also build deploy it as a Docker image:
+
+```bash
+docker build -t mention-bot .
+docker run -e GITHUB_USER="a" -p 5000:5000  mention-bot
+```
+
 ## Configuring a custom message
 
-If you want to change the default message, you can write your custom logic in [message.js](https://github.com/facebook/mention-bot/blob/master/message.js).
+If you want to change the default message, you can write your custom logic in [message.js](https://github.com/facebook/mention-bot/blob/master/message.js), or add 'message' in the [.mention-bot configuration](#configuration) file.
 
 ## How to run the bot on GitHub Enterprise
 
@@ -125,5 +153,45 @@ If you use `http` protocol, the config section like this:
 }
 ```
 
+
+## Programmatic API
+
+When you require `mention-bot` you will get all the functions exposed by [`mention-bot.js`](https://github.com/facebook/mention-bot/blob/master/mention-bot.js) module. You are expected to manage your own server and also connection to the github repository.
+
+```
+npm install mention-bot github
+```
+
+API can be used like this:
+
+```js
+var mentionBot = require('mention-bot');
+var GitHubApi = require('github');
+
+var github = new GitHubApi({ version: '3.0.0' });
+github.authenticate({
+  type: 'oauth',
+  token: '...token...'
+});
+
+mentionBot
+  .guessOwnersForPullRequest(
+    'https://github.com/fbsamples/bot-testing', // repo
+    65, // pull request number
+    'mention-bot', // user that created the pull request
+    'master', // branch
+    { maxReviewers: 3 }, // config
+    github
+  )
+  .then(function(users) {
+    // array with user names which should be included in review
+    console.log(users);
+  })
+  .catch(function(err) {
+    console.error(err);
+  });
+```
+
 ## License
-mention-bot is BSD-licensed. We also provide an additional patent grant.
+
+mention-bot is [BSD-licensed](https://github.com/facebook/mention-bot/blob/master/LICENSE). We also provide an [additional patent grant](https://github.com/facebook/mention-bot/blob/master/PATENTS).

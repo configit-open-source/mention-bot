@@ -78,7 +78,11 @@ function parseDiffFile(lines: Array<string>): FileInfo {
   }
 
   line = lines.pop();
-  if (startsWith(line, 'Binary files')) {
+  if (!line) {
+    // If the diff ends in an empty file with 0 additions or deletions, line will be null
+  } else if (startsWith(line, 'diff --git')) {
+    lines.push(line);
+  } else if (startsWith(line, 'Binary files')) {
     // We just ignore binary files (mostly images). If we want to improve the
     // precision in the future, we could look at the history of those files
     // to get more names.
@@ -247,7 +251,7 @@ function getSortedOwners(
   return sorted_owners;
 }
 
-function getDefaultOwners(
+function getMatchingOwners(
   files: Array<FileInfo>,
   whitelist: Array<WhitelistUser>
 ): Array<string> {
@@ -316,6 +320,37 @@ async function getOwnerOrgs(
   });
 }
 
+async function getMembersOfOrg(
+  org: string,
+  github: Object,
+  page: number
+): Promise<Array<string>> {
+  const perPage = 100;
+  return new Promise(function(resolve, reject) {
+    github.orgs.getMembers({
+      org: org,
+      page: page,
+      per_page: perPage
+    }, function(err, members) {
+      if (err) {
+        reject(err);
+      } else {
+        var logins = members.map(function (obj){
+          return obj.login;
+        })
+        if(logins.length === perPage) {
+          getMembersOfOrg(org, github, ++page).then(function(results) {
+            resolve(logins.concat(results));
+          })
+          .catch(reject);
+        } else {
+          resolve(logins);
+        }
+      }
+    });
+  });
+}
+
 async function filterRequiredOrgs(
   owners: Array<string>,
   config: Object,
@@ -330,6 +365,28 @@ async function filterRequiredOrgs(
     // user passes if he is in any of the required organizations
     return config.requiredOrgs.some(function(reqOrg) {
       return userOrgs[index].indexOf(reqOrg) >= 0;
+    });
+  });
+}
+
+/**
+ * If the repo is private than we should only mention users that are still part
+ * of that org.
+ * Otherwise we could end up with a situation where all the people mentioned have
+ * left the org and none of the current staff get notified
+**/
+
+async function filterPrivateRepo(
+  owners: Array<string>,
+  org: string,
+  github: Object
+): Promise<Array<string>> {
+  var currentMembers = await getMembersOfOrg(org, github, 0);
+
+  return owners.filter(function(owner, index) {
+    // user passes if they are still in the org
+    return currentMembers.some(function(member) {
+      return member === owner;
     });
   });
 }
@@ -365,6 +422,9 @@ async function guessOwners(
   blames: { [key: string]: Array<string> },
   creator: string,
   defaultOwners: Array<string>,
+  fallbackOwners: Array<string>,
+  privateRepo: boolean,
+  org: ?string,
   config: Object,
   github: Object
 ): Promise<Array<string>> {
@@ -397,6 +457,14 @@ async function guessOwners(
     owners = await filterRequiredOrgs(owners, config, github);
   }
 
+  if (privateRepo && org != null) {
+    owners = await filterPrivateRepo(owners, org, github);
+  }
+
+  if (owners.length === 0) {
+    defaultOwners = defaultOwners.concat(fallbackOwners);
+  }
+
   return owners
     .slice(0, config.maxReviewers)
     .concat(defaultOwners)
@@ -410,12 +478,18 @@ async function guessOwnersForPullRequest(
   id: number,
   creator: string,
   targetBranch: string,
+  privateRepo: boolean,
+  org: ?string,
   config: Object,
   github: Object
 ): Promise<Array<string>> {
   var diff = await fetch(repoURL + '/pull/' + id + '.diff');
   var files = parseDiff(diff);
-  var defaultOwners = getDefaultOwners(files, config.alwaysNotifyForPaths);
+  var defaultOwners = getMatchingOwners(files, config.alwaysNotifyForPaths);
+  var fallbackOwners = getMatchingOwners(files, config.fallbackNotifyForPaths);
+  if (!config.findPotentialReviewers) {
+      return defaultOwners;
+  }
 
   // There are going to be degenerated changes that end up modifying hundreds
   // of files. In theory, it would be good to actually run the algorithm on
@@ -449,7 +523,7 @@ async function guessOwnersForPullRequest(
 
   // This is the line that implements the actual algorithm, all the lines
   // before are there to fetch and extract the data needed.
-  return guessOwners(files, blames, creator, defaultOwners, config, github);
+  return guessOwners(files, blames, creator, defaultOwners, fallbackOwners, privateRepo, org, config, github);
 }
 
 module.exports = {
